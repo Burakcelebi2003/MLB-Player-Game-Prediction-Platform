@@ -1,0 +1,992 @@
+%%writefile sabermetrics_gui.py
+import streamlit as st
+import numpy as np
+import pandas as pd
+import plotly.express as px
+
+from sklearn.base import clone
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor
+from sklearn.linear_model import Ridge, PoissonRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+# Optional XGBoost: the app still works if it is not installed.
+try:
+    from xgboost import XGBRegressor
+    XGB_AVAILABLE = True
+except Exception:
+    XGB_AVAILABLE = False
+
+
+# ============================================================
+# 1. FEATURE ENGINEERING
+# ============================================================
+
+class MLFeatureExtractor:
+    """Fixed Streamlit input structure -> reusable ML feature vector."""
+
+    @staticmethod
+    def extract_time_series_features(scores, prefix="hits"):
+        arr = np.asarray(scores, dtype=float)
+
+        if len(arr) == 0:
+            arr = np.array([0.0])
+
+        n = len(arr)
+        x = np.arange(n)
+
+        features = {
+            f"{prefix}_mean": float(np.mean(arr)),
+            f"{prefix}_std": float(np.std(arr, ddof=0)),
+            f"{prefix}_max": float(np.max(arr)),
+            f"{prefix}_min": float(np.min(arr)),
+            f"{prefix}_median": float(np.median(arr)),
+            f"{prefix}_wma": float(np.average(arr, weights=np.arange(1, n + 1))),
+            f"{prefix}_ewma": float(pd.Series(arr).ewm(span=min(7, n), adjust=False).mean().iloc[-1]),
+        }
+
+        if n > 1:
+            slope, intercept = np.polyfit(x, arr, 1)
+            features[f"{prefix}_slope"] = float(slope)
+            features[f"{prefix}_recent_delta"] = float(arr[-1] - arr[0])
+        else:
+            features[f"{prefix}_slope"] = 0.0
+            features[f"{prefix}_recent_delta"] = 0.0
+
+        # Rolling form windows. These are robust to the user's fixed 100-game input.
+        for window in [3, 7, 15, 30]:
+            if n >= window:
+                recent = arr[-window:]
+            else:
+                recent = arr
+
+            features[f"{prefix}_l{window}_mean"] = float(np.mean(recent))
+            features[f"{prefix}_l{window}_std"] = float(np.std(recent, ddof=0))
+            features[f"{prefix}_l{window}_ewma"] = float(
+                pd.Series(recent).ewm(span=min(7, len(recent)), adjust=False).mean().iloc[-1]
+            )
+
+        # Last-game / last-3-game form
+        features[f"{prefix}_last"] = float(arr[-1])
+        features[f"{prefix}_last3_mean"] = float(np.mean(arr[-3:]))
+
+        return features
+
+    @staticmethod
+    def extract_sabermetric_features(batter_stats, league_stats):
+        feats = {}
+        metrics = ["xwOBA", "wRC+", "RE24"]
+
+        for metric in metrics:
+            mean_val = float(league_stats[metric]["mean"])
+            std_val = float(league_stats[metric]["std"])
+
+            season = float(batter_stats[metric]["season"])
+            l30 = float(batter_stats[metric]["l30"])
+            l7 = float(batter_stats[metric]["l7"])
+            vs_pitcher = float(batter_stats[metric]["vs_pitcher"])
+
+            for label, value in [
+                ("season", season),
+                ("l30", l30),
+                ("l7", l7),
+                ("vs_pitcher", vs_pitcher),
+            ]:
+                feats[f"{metric}_z_{label}"] = (
+                    (value - mean_val) / std_val if std_val > 0 else 0.0
+                )
+
+            feats[f"{metric}_delta_l7_season"] = l7 - season
+            feats[f"{metric}_delta_l30_season"] = l30 - season
+            feats[f"{metric}_delta_vs_pitcher_season"] = vs_pitcher - season
+
+        return feats
+
+    @staticmethod
+    def add_context_features(features, context):
+        """Optional context fields; zero/neutral defaults keep the UI simple."""
+        features.update({
+            "expected_pa": float(context.get("expected_pa", 4.2)),
+            "batting_order": float(context.get("batting_order", 5)),
+            "home": float(context.get("home", 1)),
+            "platoon_advantage": float(context.get("platoon_advantage", 0)),
+            "opponent_pitcher_quality": float(context.get("opponent_pitcher_quality", 0)),
+            "park_factor": float(context.get("park_factor", 100)),
+            "runners_opportunity": float(context.get("runners_opportunity", 0)),
+        })
+        return features
+
+
+# ============================================================
+# 2. MODEL FACTORY
+# ============================================================
+
+def model_factory(model_name, target="hits"):
+    """Creates a model. No model is trained here."""
+
+    if model_name == "Random Forest":
+        return RandomForestRegressor(
+            n_estimators=400,
+            max_depth=7,
+            min_samples_leaf=3,
+            max_features="sqrt",
+            random_state=42,
+            n_jobs=-1,
+        )
+
+    if model_name == "Gradient Boosting":
+        return GradientBoostingRegressor(
+            n_estimators=250,
+            learning_rate=0.03,
+            max_depth=3,
+            min_samples_leaf=5,
+            loss="huber",
+            random_state=42,
+        )
+
+    if model_name == "HistGradient Boosting":
+        return HistGradientBoostingRegressor(
+            max_iter=300,
+            learning_rate=0.04,
+            max_leaf_nodes=15,
+            l2_regularization=1.0,
+            random_state=42,
+        )
+
+    if model_name == "XGBoost" and XGB_AVAILABLE:
+        return XGBRegressor(
+            n_estimators=350,
+            max_depth=3,
+            learning_rate=0.03,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            objective="reg:squarederror",
+            random_state=42,
+            n_jobs=-1,
+        )
+
+    if model_name == "Poisson Regression":
+        return Pipeline([
+            ("scaler", StandardScaler()),
+            ("poisson", PoissonRegressor(alpha=0.5, max_iter=1000))
+        ])
+
+    # Ridge baseline
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("ridge", Ridge(alpha=2.0))
+    ])
+
+
+# ============================================================
+# 3. DATASET CREATION FROM REAL STREAMLIT INPUT
+# ============================================================
+
+def parse_series(text, expected_min=1, max_len=None):
+    values = [float(x.strip()) for x in str(text).split(",") if x.strip()]
+
+    if len(values) < expected_min:
+        raise ValueError(f"En az {expected_min} gözlem girilmeli.")
+
+    if max_len is not None and len(values) > max_len:
+        values = values[-max_len:]
+
+    return values
+
+
+def build_training_rows_from_100_game_logs(
+    hits_100,
+    rbi_100,
+    window_size=30,
+):
+    """
+    Converts a 100-game real log into supervised observations.
+
+    For each game t:
+      X = previous `window_size` games
+      y = game t
+
+    Thus the model learns from REAL sequential observations instead of
+    synthetic Poisson observations.
+
+    With 100 games and window=30, this produces 70 rows per target.
+    """
+
+    if len(hits_100) != len(rbi_100):
+        raise ValueError("Hits ve RBI serileri aynı uzunlukta olmalı.")
+
+    if len(hits_100) <= window_size:
+        raise ValueError(
+            f"Eğitim için en az {window_size + 1} maç gerekiyor."
+        )
+
+    rows = []
+    targets_hits = []
+    targets_rbi = []
+
+    for t in range(window_size, len(hits_100)):
+        h_history = hits_100[t - window_size:t]
+        r_history = rbi_100[t - window_size:t]
+
+        features = {}
+        features.update(
+            MLFeatureExtractor.extract_time_series_features(
+                h_history, prefix="hits"
+            )
+        )
+        features.update(
+            MLFeatureExtractor.extract_time_series_features(
+                r_history, prefix="rbi"
+            )
+        )
+
+        # Real-game target
+        rows.append(features)
+        targets_hits.append(hits_100[t])
+        targets_rbi.append(rbi_100[t])
+
+    return pd.DataFrame(rows), np.asarray(targets_hits), np.asarray(targets_rbi)
+
+
+def augment_training_with_sabermetrics(
+    X,
+    batter_stats,
+    league_stats,
+):
+    """Adds current/player-level sabermetric state to every training row."""
+    saber = MLFeatureExtractor.extract_sabermetric_features(
+        batter_stats, league_stats
+    )
+
+    saber_df = pd.DataFrame(
+        [saber] * len(X),
+        index=X.index
+    )
+
+    return pd.concat([X.reset_index(drop=True), saber_df.reset_index(drop=True)], axis=1)
+
+
+# ============================================================
+# 4. TIME-SERIES VALIDATION
+# ============================================================
+
+def evaluate_time_series_model(model, X, y, n_splits=5):
+    """
+    Walk-forward style validation.
+    No random train/test split is used.
+    """
+    if len(X) < 12:
+        return None, None
+
+    n_splits = min(n_splits, max(2, len(X) // 8))
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
+    predictions = []
+    actuals = []
+
+    for train_idx, test_idx in tscv.split(X):
+        fold_model = clone(model)
+        X_train = X.iloc[train_idx]
+        X_test = X.iloc[test_idx]
+        y_train = y[train_idx]
+        y_test = y[test_idx]
+
+        fold_model.fit(X_train, y_train)
+        pred = fold_model.predict(X_test)
+
+        predictions.extend(pred.tolist())
+        actuals.extend(y_test.tolist())
+
+    predictions = np.asarray(predictions)
+    actuals = np.asarray(actuals)
+
+    metrics = {
+        "MAE": mean_absolute_error(actuals, predictions),
+        "RMSE": np.sqrt(mean_squared_error(actuals, predictions)),
+        "R2": r2_score(actuals, predictions) if len(np.unique(actuals)) > 1 else np.nan,
+    }
+
+    return metrics, predictions
+
+
+def fit_and_validate_models(X, y, model_names):
+    results = []
+    fitted = {}
+
+    for name in model_names:
+        model = model_factory(name)
+
+        metrics, _ = evaluate_time_series_model(model, X, y)
+
+        if metrics is None:
+            continue
+
+        results.append({
+            "Model": name,
+            "MAE": metrics["MAE"],
+            "RMSE": metrics["RMSE"],
+            "R²": metrics["R2"],
+        })
+
+        final_model = clone(model)
+        final_model.fit(X, y)
+        fitted[name] = final_model
+
+    result_df = pd.DataFrame(results)
+
+    if result_df.empty:
+        return result_df, fitted, None
+
+    # RMSE is the primary selection metric.
+    best_name = result_df.sort_values("RMSE").iloc[0]["Model"]
+
+    return result_df.sort_values("RMSE"), fitted, best_name
+
+
+# ============================================================
+# 5. DISTRIBUTION / MONTE CARLO
+# ============================================================
+
+def simulate_count_distribution(expected_value, iters):
+    """
+    Uses Poisson only as the final count simulation layer.
+    The expected value itself comes from the trained ML model.
+    """
+    lam = max(0.001, float(expected_value))
+    return np.random.poisson(lam=lam, size=iters)
+
+
+def empirical_interval(sim):
+    return (
+        float(np.quantile(sim, 0.05)),
+        float(np.quantile(sim, 0.95))
+    )
+
+
+# ============================================================
+# 6. STREAMLIT APP
+# ============================================================
+
+st.set_page_config(
+    page_title="ML Sabermetrics Hitter Projector",
+    layout="wide",
+    page_icon="⚾"
+)
+
+st.title("⚾Hitter Projeksiyonu")
+
+st.caption(
+    "100 maçlık gerçek log → 30 maçlık rolling training window → "
+    "walk-forward validation → ML model → Poisson/Monte Carlo dağılımı"
+)
+
+# ----------------------------
+# Sidebar
+# ----------------------------
+
+st.sidebar.header("⚙️Model Ayarları")
+
+model_choice = st.sidebar.selectbox(
+    "Ana Model",
+    [
+        "Random Forest",
+        "Gradient Boosting",
+        "HistGradient Boosting",
+        "Ridge Regression",
+        "Poisson Regression",
+    ] + (["XGBoost"] if XGB_AVAILABLE else [])
+)
+
+auto_select = st.sidebar.checkbox(
+    "Walk-forward sonucuna göre en iyi modeli otomatik seç",
+    value=True
+)
+
+iters = st.sidebar.number_input(
+    "Monte-Carlo İterasyon Sayısı",
+    min_value=1000,
+    max_value=100000,
+    value=10000,
+    step=1000
+)
+
+# Keep league reference values editable but stable.
+st.sidebar.markdown("---")
+st.sidebar.subheader("League Reference")
+
+league_stats = {
+    "xwOBA": {
+        "mean": st.sidebar.number_input("League xwOBA mean", value=0.320, format="%.3f"),
+        "std": st.sidebar.number_input("League xwOBA SD", value=0.025, format="%.3f"),
+    },
+    "wRC+": {
+        "mean": st.sidebar.number_input("League wRC+ mean", value=100.0),
+        "std": st.sidebar.number_input("League wRC+ SD", value=15.0),
+    },
+    "RE24": {
+        "mean": st.sidebar.number_input("League RE24 mean", value=0.0),
+        "std": st.sidebar.number_input("League RE24 SD", value=10.0),
+    },
+}
+
+# ============================================================
+# PLAYER INPUT
+# ============================================================
+
+col1, col2 = st.columns([1.1, 1.5])
+
+with col1:
+    st.subheader("Oyuncu Veri Girişi")
+
+    st.markdown(
+        "### 📊Son 100 Maç\n"
+        "Bu bölüm **eğitim verisinin kaynağıdır**. Gerçek oyuncu game-log verisini "
+        "100 maç olarak gir."
+    )
+
+    # Otomatik test/denetim için Poisson dağılımına uygun rastgele 100 maç verisi
+    random_hits_100 = ",".join(map(str, np.random.poisson(0.9, 100)))
+    random_rbis_100 = ",".join(map(str, np.random.poisson(0.5, 100)))
+
+    hits_input_100 = st.text_area(
+        "Son 100 Maç Hit Sayıları",
+        value=random_hits_100,
+        height=100,
+        key="h100",
+        placeholder="0,1,2,1,0,... toplam 100 değer"
+    )
+
+    rbis_input_100 = st.text_area(
+        "Son 100 Maç RBI Sayıları",
+        value=random_rbis_100,
+        height=100,
+        key="r100",
+        placeholder="0,0,1,0,2,... toplam 100 değer"
+    )
+
+
+    st.markdown("### 🎯Güncel Form")
+
+    tab_30, tab_7, tab_3 = st.tabs(
+        ["Son 30 Maç", "Son 7 Maç", "Vs Pitcher Son 3 Maç"]
+    )
+
+    with tab_30:
+        hits_input_30 = st.text_area(
+            "Hit — Son 30 Maç",
+            value="1,0,2,1,1,0,2,1,0,1,1,0,0,2,1,0,1,0,2,0,1,1,0,0,1,2,1,0,1,1",
+            key="h30"
+        )
+        rbis_input_30 = st.text_area(
+            "RBI — Son 30 Maç",
+            value="0,0,1,2,0,0,1,0,0,1,0,0,0,1,1,0,0,0,2,0,0,1,0,0,1,2,0,0,0,1",
+            key="r30"
+        )
+
+    with tab_7:
+        hits_input_7 = st.text_input(
+            "Hit — Son 7 Maç",
+            value="1,2,0,1,1,0,2",
+            key="h7"
+        )
+        rbis_input_7 = st.text_input(
+            "RBI — Son 7 Maç",
+            value="0,1,0,1,0,0,2",
+            key="r7"
+        )
+
+    with tab_3:
+        hits_input_3 = st.text_input(
+            "Vs Pitcher Hit",
+            value="1,2,1",
+            key="h3"
+        )
+        rbis_input_3 = st.text_input(
+            "Vs Pitcher RBI",
+            value="0,2,1",
+            key="r3"
+        )
+
+with col2:
+    st.subheader("🎯Sabermetric Form Matrisi")
+
+    df_batter = st.data_editor(
+        pd.DataFrame(
+            {
+                "xwOBA": [0.380, 0.410, 0.430, 0.395],
+                "wRC+": [145, 160, 175, 150],
+                "RE24": [12.0, 5.0, 3.0, 2.5]
+            },
+            index=["season", "l30", "l7", "vs_pitcher"]
+        ),
+        use_container_width=True,
+        key="batter_stats"
+    )
+
+    st.subheader("Opsiyonel İçerik")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        expected_pa = st.number_input(
+            "Expected PA", min_value=1.0, max_value=7.0, value=4.2, step=0.1
+        )
+        batting_order = st.number_input(
+            "Batting Order", min_value=1, max_value=9, value=5
+        )
+
+    with c2:
+        home = st.selectbox("Home/Away", ["Home", "Away"])
+        platoon = st.selectbox(
+            "Platoon Advantage",
+            ["Neutral", "Advantage", "Disadvantage"]
+        )
+
+    with c3:
+        pitcher_quality = st.number_input(
+            "Opponent Pitcher Quality (z)",
+            min_value=-3.0,
+            max_value=3.0,
+            value=0.0,
+            step=0.1
+        )
+
+        park_factor = st.number_input(
+            "Park Factor",
+            min_value=70.0,
+            max_value=140.0,
+            value=100.0,
+            step=1.0
+        )
+
+    runners_opportunity = st.number_input(
+        "RBI Runner Opportunity (0–1)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.45,
+        step=0.01
+    )
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+if st.button(
+    "🚀Tahmin Et",
+    use_container_width=True
+):
+    try:
+        # ----------------------------
+        # Parse 100-game training data
+        # ----------------------------
+
+        hits_100 = parse_series(
+            hits_input_100,
+            expected_min=31,
+            max_len=100
+        )
+
+        rbis_100 = parse_series(
+            rbis_input_100,
+            expected_min=31,
+            max_len=100
+        )
+
+        if len(hits_100) != 100 or len(rbis_100) != 100:
+            st.error(
+                f"Bu sürüm eğitim için tam 100 maç bekliyor. "
+                f"Şu an Hits={len(hits_100)}, RBI={len(rbis_100)}."
+            )
+            st.stop()
+
+        # ----------------------------
+        # Parse current windows
+        # ----------------------------
+
+        hits_30 = parse_series(hits_input_30)
+        rbis_30 = parse_series(rbis_input_30)
+        hits_7 = parse_series(hits_input_7)
+        rbis_7 = parse_series(rbis_input_7)
+        hits_3 = parse_series(hits_input_3)
+        rbis_3 = parse_series(rbis_input_3)
+
+        # ----------------------------
+        # Real training set
+        # ----------------------------
+
+        X_train, y_hits, y_rbi = build_training_rows_from_100_game_logs(
+            hits_100,
+            rbis_100,
+            window_size=30
+        )
+
+        # Add current sabermetric state.
+        batter_dict = df_batter.to_dict()
+
+        X_train = augment_training_with_sabermetrics(
+            X_train,
+            batter_dict,
+            league_stats
+        )
+
+        # Training context is neutral by default.
+        # Current context is deliberately only applied to the prediction row.
+        context = {
+            "expected_pa": expected_pa,
+            "batting_order": batting_order,
+            "home": 1 if home == "Home" else 0,
+            "platoon_advantage": (
+                1 if platoon == "Advantage"
+                else -1 if platoon == "Disadvantage"
+                else 0
+            ),
+            "opponent_pitcher_quality": pitcher_quality,
+            "park_factor": park_factor,
+            "runners_opportunity": runners_opportunity,
+        }
+
+        # Add neutral context columns to training data so prediction has the
+        # same schema. This avoids pretending historical context is known.
+        for key, default_value in {
+            "expected_pa": 4.2,
+            "batting_order": 5.0,
+            "home": 0.5,
+            "platoon_advantage": 0.0,
+            "opponent_pitcher_quality": 0.0,
+            "park_factor": 100.0,
+            "runners_opportunity": 0.45,
+        }.items():
+            X_train[key] = default_value
+
+        # ----------------------------
+        # Current prediction features
+        # ----------------------------
+
+        prediction_features = {}
+
+        prediction_features.update(
+            MLFeatureExtractor.extract_time_series_features(
+                hits_30, prefix="hits"
+            )
+        )
+
+        prediction_features.update(
+            MLFeatureExtractor.extract_time_series_features(
+                rbis_30, prefix="rbi"
+            )
+        )
+
+        # Additional explicit L7 / L3 signals.
+        prediction_features.update({
+            "hits_external_l7_mean": float(np.mean(hits_7)),
+            "hits_external_l7_ewma": float(
+                pd.Series(hits_7).ewm(span=min(7, len(hits_7)), adjust=False).mean().iloc[-1]
+            ),
+            "rbi_external_l7_mean": float(np.mean(rbis_7)),
+            "rbi_external_l7_ewma": float(
+                pd.Series(rbis_7).ewm(span=min(7, len(rbis_7)), adjust=False).mean().iloc[-1]
+            ),
+            "hits_vs_pitcher_mean": float(np.mean(hits_3)),
+            "rbi_vs_pitcher_mean": float(np.mean(rbis_3)),
+        })
+
+        prediction_features.update(
+            MLFeatureExtractor.extract_sabermetric_features(
+                batter_dict,
+                league_stats
+            )
+        )
+
+        prediction_features = MLFeatureExtractor.add_context_features(
+            prediction_features,
+            context
+        )
+
+        X_pred = pd.DataFrame([prediction_features])
+
+        # Exact same columns/order as training.
+        X_pred = X_pred.reindex(
+            columns=X_train.columns,
+            fill_value=0.0
+        )
+
+        # ----------------------------
+        # Model candidates
+        # ----------------------------
+
+        candidate_models = [
+            "Random Forest",
+            "Gradient Boosting",
+            "HistGradient Boosting",
+            "Ridge Regression",
+            "Poisson Regression",
+        ]
+
+        if XGB_AVAILABLE:
+            candidate_models.append("XGBoost")
+
+        # Evaluate hit and RBI models separately.
+        hit_results, hit_fitted, best_hit = fit_and_validate_models(
+            X_train, y_hits, candidate_models
+        )
+
+        rbi_results, rbi_fitted, best_rbi = fit_and_validate_models(
+            X_train, y_rbi, candidate_models
+        )
+
+        if hit_results.empty or rbi_results.empty:
+            st.error("Validation için yeterli gerçek veri oluşmadı.")
+            st.stop()
+
+        # User can either force a model or let validation choose.
+        selected_hit = best_hit if auto_select else model_choice
+        selected_rbi = best_rbi if auto_select else model_choice
+
+        # If forced model was not available for some reason, use best.
+        if selected_hit not in hit_fitted:
+            selected_hit = best_hit
+
+        if selected_rbi not in rbi_fitted:
+            selected_rbi = best_rbi
+
+        hit_model = hit_fitted[selected_hit]
+        rbi_model = rbi_fitted[selected_rbi]
+
+        lambda_hit = max(
+            0.001,
+            float(hit_model.predict(X_pred)[0])
+        )
+
+        lambda_rbi = max(
+            0.001,
+            float(rbi_model.predict(X_pred)[0])
+        )
+
+        # ----------------------------
+        # Monte Carlo
+        # ----------------------------
+
+        sim_hits = simulate_count_distribution(lambda_hit, iters)
+        sim_rbis = simulate_count_distribution(lambda_rbi, iters)
+
+        hit_ci = empirical_interval(sim_hits)
+        rbi_ci = empirical_interval(sim_rbis)
+
+        # ----------------------------
+        # Results
+        # ----------------------------
+
+        st.success(
+            "Gerçek 100 maçlık veriyle supervised learning + "
+            "walk-forward validation + Monte Carlo tamamlandı."
+        )
+
+        m1, m2, m3, m4 = st.columns(4)
+
+        m1.metric(
+            "Beklenen Hit",
+            f"{lambda_hit:.3f}",
+            help="Gerçek game-log verisinden eğitilmiş ML modelinin beklenen değeri."
+        )
+
+        m2.metric(
+            "Hit %90 Aralık",
+            f"{hit_ci[0]:.0f}–{hit_ci[1]:.0f}"
+        )
+
+        m3.metric(
+            "Beklenen RBI",
+            f"{lambda_rbi:.3f}"
+        )
+
+        m4.metric(
+            "RBI %90 Aralık",
+            f"{rbi_ci[0]:.0f}–{rbi_ci[1]:.0f}"
+        )
+
+        st.markdown("---")
+
+        # ----------------------------
+        # Validation comparison
+        # ----------------------------
+
+        v1, v2 = st.columns(2)
+
+        with v1:
+            st.subheader("Hit Model Doğruluğu")
+            st.dataframe(
+                hit_results.style.format({
+                    "MAE": "{:.4f}",
+                    "RMSE": "{:.4f}",
+                    "R²": "{:.4f}",
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+            st.caption(f"Seçilen Hit modeli: **{selected_hit}**")
+
+        with v2:
+            st.subheader("RBI Model Validation")
+            st.dataframe(
+                rbi_results.style.format({
+                    "MAE": "{:.4f}",
+                    "RMSE": "{:.4f}",
+                    "R²": "{:.4f}",
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+            st.caption(f"Seçilen RBI modeli: **{selected_rbi}**")
+
+        # ----------------------------
+        # Distribution
+        # ----------------------------
+
+        st.markdown("---")
+        chart_col, feature_col = st.columns([1.4, 1])
+
+        with chart_col:
+            st.subheader("Monte Carlo Dağılımı")
+
+            max_count = int(
+                max(
+                    np.percentile(sim_hits, 99.5),
+                    np.percentile(sim_rbis, 99.5),
+                    5
+                )
+            )
+            max_count = min(max_count, 10)
+
+            hit_probs = [
+                np.mean(sim_hits == i) * 100
+                for i in range(max_count + 1)
+            ]
+
+            rbi_probs = [
+                np.mean(sim_rbis == i) * 100
+                for i in range(max_count + 1)
+            ]
+
+            df_dist = pd.DataFrame({
+                "Adet": list(range(max_count + 1)) * 2,
+                "Olasılık (%)": hit_probs + rbi_probs,
+                "Tip": (
+                    ["Hit"] * (max_count + 1)
+                    + ["RBI"] * (max_count + 1)
+                )
+            })
+
+            fig = px.bar(
+                df_dist,
+                x="Adet",
+                y="Olasılık (%)",
+                color="Tip",
+                barmode="group",
+                text_auto=".1f"
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+        with feature_col:
+            st.subheader("Prediction Features")
+
+            feature_display = (
+                X_pred.T
+                .rename(columns={0: "Value"})
+                .sort_values("Value", key=lambda s: s.abs(), ascending=False)
+            )
+
+            st.dataframe(
+                feature_display.head(25),
+                use_container_width=True
+            )
+
+        # ----------------------------
+        # Training information
+        # ----------------------------
+
+        st.markdown("---")
+        st.subheader("🧠Model Öğrenme Özeti")
+
+        info_cols = st.columns(4)
+
+        info_cols[0].metric(
+            "Gerçek Maç",
+            len(hits_100)
+        )
+
+        info_cols[1].metric(
+            "Supervised Observation",
+            len(X_train)
+        )
+
+        info_cols[2].metric(
+            "ML Feature",
+            X_train.shape[1]
+        )
+
+        info_cols[3].metric(
+            "Validation",
+            "Walk-Forward"
+        )
+
+        st.caption(
+            "Önemli: 100 maç burada tek bir eğitim satırı olarak kullanılmıyor. "
+            "İlk 30 maç geçmiş olarak alınarak 31. maçtan 100. maça kadar "
+            "yaklaşık 70 gerçek supervised gözlem oluşturuluyor."
+        )
+
+        # ----------------------------
+        # Feature importance
+        # ----------------------------
+
+        st.markdown("---")
+        st.subheader("🔎Feature Importance")
+
+        if hasattr(hit_model, "feature_importances_"):
+            fi = pd.DataFrame({
+                "Feature": X_train.columns,
+                "Importance": hit_model.feature_importances_
+            }).sort_values("Importance", ascending=False)
+
+            st.dataframe(
+                fi.head(20),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            fig_fi = px.bar(
+                fi.head(15).sort_values("Importance"),
+                x="Importance",
+                y="Feature",
+                orientation="h",
+                title="Hit Model — Top 15 Features"
+            )
+            st.plotly_chart(fig_fi, use_container_width=True)
+
+        elif hasattr(hit_model, "coef_"):
+            coef = np.ravel(hit_model.coef_)
+            fi = pd.DataFrame({
+                "Feature": X_train.columns,
+                "Coefficient": coef,
+                "AbsCoefficient": np.abs(coef)
+            }).sort_values("AbsCoefficient", ascending=False)
+
+            st.dataframe(
+                fi.head(20),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        else:
+            st.info(
+                "Bu model ailesinde doğrudan feature importance mevcut değil. "
+                "SHAP katmanı sonraki aşamada eklenebilir."
+            )
+
+    except Exception as e:
+        st.error(f"ML işlemi sırasında hata oluştu: {e}")
+        st.exception(e)
